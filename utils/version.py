@@ -4,10 +4,14 @@ from utils.console import print_step
 
 
 def checkversion(__VERSION__: str):
-    response = requests.get(
-        "https://api.github.com/repos/elebumm/RedditVideoMakerBot/releases/latest"
-    )
-    latestversion = response.json()["tag_name"]
+    try:
+        response = requests.get(
+            "https://api.github.com/repos/elebumm/RedditVideoMakerBot/releases/latest",
+            timeout=5,
+        )
+        latestversion = response.json()["tag_name"]
+    except Exception:
+        return False
     if __VERSION__ == latestversion:
         print_step(f"You are using the newest version ({__VERSION__}) of the bot")
         return True

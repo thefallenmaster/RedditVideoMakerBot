@@ -107,6 +107,58 @@ def check_vars(path, checks):
     crawl_and_check(config, path, checks)
 
 
+def _build_defaults(template_obj: dict) -> dict:
+    """Builds a dictionary of default config values from the TOML template."""
+    defaults = {}
+    for key, val in template_obj.items():
+        if isinstance(val, dict) and "optional" not in val:
+            defaults[key] = _build_defaults(val)
+        elif isinstance(val, dict):
+            defaults[key] = val.get("default", "")
+    return defaults
+
+
+def _deep_merge(defaults: dict, overrides: dict) -> dict:
+    """Recursively merges user config overrides onto template defaults."""
+    merged = {}
+    for key, default_val in defaults.items():
+        if key in overrides:
+            override_val = overrides[key]
+            if isinstance(default_val, dict) and isinstance(override_val, dict):
+                merged[key] = _deep_merge(default_val, override_val)
+            else:
+                merged[key] = override_val
+        else:
+            merged[key] = default_val
+    for key, override_val in overrides.items():
+        if key not in merged:
+            merged[key] = override_val
+    return merged
+
+
+def load_config(template_file, config_file) -> Dict:
+    """Loads config.toml merged with template defaults without interactive checks."""
+    global config
+    template = toml.load(template_file)
+    defaults = _build_defaults(template)
+
+    config_path = Path(config_file)
+    user_config = {}
+    if config_path.exists():
+        raw_text = config_path.read_text(encoding="utf-8").strip()
+        if raw_text:
+            try:
+                user_config = toml.loads(raw_text)
+            except toml.TomlDecodeError as error:
+                console.print(f"[yellow]Warning: Could not parse {config_file} ({error}); using defaults.")
+
+    config = _deep_merge(defaults, user_config)
+    if not config_path.exists() or not config_path.read_text(encoding="utf-8").strip():
+        with open(config_file, "w", encoding="utf-8") as f:
+            toml.dump(config, f)
+    return config
+
+
 def check_toml(template_file, config_file) -> Tuple[bool, Dict]:
     global config
     config = None

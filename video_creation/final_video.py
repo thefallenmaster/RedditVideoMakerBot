@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import re
+import subprocess
 import tempfile
 import textwrap
 import threading
@@ -84,6 +85,30 @@ def name_normalize(name: str) -> str:
         return name
 
 
+def _get_video_encoder() -> str:
+    """Returns h264_nvenc if supported by ffmpeg, otherwise libx264."""
+    try:
+        encoders = subprocess.check_output(
+            ["ffmpeg", "-encoders"], text=True, stderr=subprocess.DEVNULL
+        )
+        if "h264_nvenc" in encoders:
+            return "h264_nvenc"
+    except Exception:
+        pass
+    return "libx264"
+
+
+def _has_ffmpeg_filter(filter_name: str) -> bool:
+    """Checks whether the installed ffmpeg supports a given filter."""
+    try:
+        filters = subprocess.check_output(
+            ["ffmpeg", "-filters"], text=True, stderr=subprocess.DEVNULL
+        )
+        return re.search(rf"\b{re.escape(filter_name)}\b", filters) is not None
+    except Exception:
+        return False
+
+
 def prepare_background(reddit_id: str, W: int, H: int) -> str:
     output_path = f"assets/temp/{reddit_id}/background_noaudio.mp4"
     output = (
@@ -93,7 +118,7 @@ def prepare_background(reddit_id: str, W: int, H: int) -> str:
             output_path,
             an=None,
             **{
-                "c:v": "h264_nvenc",
+                "c:v": _get_video_encoder(),
                 "b:v": "20M",
                 "b:a": "192k",
                 "threads": multiprocessing.cpu_count(),
@@ -104,7 +129,7 @@ def prepare_background(reddit_id: str, W: int, H: int) -> str:
     try:
         output.run(quiet=True)
     except ffmpeg.Error as e:
-        print(e.stderr.decode("utf8"))
+        print(e.stderr.decode("utf8") if e.stderr else str(e))
         exit(1)
     return output_path
 
@@ -228,7 +253,7 @@ def make_final_video(
 
     # Gather all audio clips
     audio_clips = list()
-    if number_of_clips == 0 and settings.config["settings"]["storymode"] == "false":
+    if number_of_clips == 0 and not settings.config["settings"]["storymode"]:
         print(
             "No audio clips to gather. Please use a different TTS or post."
         )  # This is to fix the TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
@@ -297,17 +322,13 @@ def make_final_video(
 
     current_time = 0
     if settings.config["settings"]["storymode"]:
-        audio_clips_durations = [
-            float(
-                ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/postaudio-{i}.mp3")["format"]["duration"]
-            )
-            for i in range(number_of_clips)
-        ]
-        audio_clips_durations.insert(
-            0,
-            float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]),
-        )
         if settings.config["settings"]["storymodemethod"] == 0:
+            audio_clips_durations = [
+                float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]),
+                float(
+                    ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/postaudio.mp3")["format"]["duration"]
+                ),
+            ]
             image_clips.insert(
                 1,
                 ffmpeg.input(f"assets/temp/{reddit_id}/png/story_content.png").filter(
@@ -322,12 +343,25 @@ def make_final_video(
             )
             current_time += audio_clips_durations[0]
         elif settings.config["settings"]["storymodemethod"] == 1:
+            audio_clips_durations = [
+                float(
+                    ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/postaudio-{i}.mp3")["format"][
+                        "duration"
+                    ]
+                )
+                for i in range(number_of_clips + 1)
+            ]
+            audio_clips_durations.insert(
+                0,
+                float(ffmpeg.probe(f"assets/temp/{reddit_id}/mp3/title.mp3")["format"]["duration"]),
+            )
             for i in track(range(0, number_of_clips + 1), "Collecting the image files..."):
                 image_clips.append(
                     ffmpeg.input(f"assets/temp/{reddit_id}/png/img{i}.png")["v"].filter(
                         "scale", screenshot_width, -1
                     )
                 )
+            for i in range(0, len(audio_clips_durations)):
                 background_clip = background_clip.overlay(
                     image_clips[i],
                     enable=f"between(t,{current_time},{current_time + audio_clips_durations[i]})",
@@ -336,12 +370,13 @@ def make_final_video(
                 )
                 current_time += audio_clips_durations[i]
     else:
-        for i in range(0, number_of_clips + 1):
+        for i in range(0, number_of_clips):
             image_clips.append(
                 ffmpeg.input(f"assets/temp/{reddit_id}/png/comment_{i}.png")["v"].filter(
                     "scale", screenshot_width, -1
                 )
             )
+        for i in range(0, number_of_clips + 1):
             image_overlay = image_clips[i].filter("colorchannelmixer", aa=opacity)
             assert (
                 audio_clips_durations is not None
@@ -405,15 +440,16 @@ def make_final_video(
             print_substep(f"Thumbnail - Building Thumbnail in assets/temp/{reddit_id}/thumbnail.png")
 
     text = f"Background by {background_config['video'][2]}"
-    background_clip = ffmpeg.drawtext(
-        background_clip,
-        text=text,
-        x=f"(w-text_w)",
-        y=f"(h-text_h)",
-        fontsize=5,
-        fontcolor="White",
-        fontfile=os.path.join("fonts", "Roboto-Regular.ttf"),
-    )
+    if _has_ffmpeg_filter("drawtext"):
+        background_clip = ffmpeg.drawtext(
+            background_clip,
+            text=text,
+            x=f"(w-text_w)",
+            y=f"(h-text_h)",
+            fontsize=5,
+            fontcolor="White",
+            fontfile=os.path.join("fonts", "Roboto-Regular.ttf"),
+        )
     background_clip = background_clip.filter("scale", W, H)
     print_step("Rendering the video 🎥")
     from tqdm import tqdm
@@ -425,6 +461,7 @@ def make_final_video(
         old_percentage = pbar.n
         pbar.update(status - old_percentage)
 
+    video_encoder = _get_video_encoder()
     defaultPath = f"results/{subreddit}"
     with ProgressFfmpeg(length, on_update_example) as progress:
         path = defaultPath + f"/{filename}"
@@ -438,7 +475,7 @@ def make_final_video(
                 path,
                 f="mp4",
                 **{
-                    "c:v": "h264_nvenc",
+                    "c:v": video_encoder,
                     "b:v": "20M",
                     "b:a": "192k",
                     "threads": multiprocessing.cpu_count(),
@@ -450,7 +487,7 @@ def make_final_video(
                 capture_stderr=False,
             )
         except ffmpeg.Error as e:
-            print(e.stderr.decode("utf8"))
+            print(e.stderr.decode("utf8") if e.stderr else str(e))
             exit(1)
     old_percentage = pbar.n
     pbar.update(100 - old_percentage)
@@ -468,7 +505,7 @@ def make_final_video(
                     path,
                     f="mp4",
                     **{
-                        "c:v": "h264_nvenc",
+                        "c:v": video_encoder,
                         "b:v": "20M",
                         "b:a": "192k",
                         "threads": multiprocessing.cpu_count(),
@@ -480,7 +517,7 @@ def make_final_video(
                     capture_stderr=False,
                 )
             except ffmpeg.Error as e:
-                print(e.stderr.decode("utf8"))
+                print(e.stderr.decode("utf8") if e.stderr else str(e))
                 exit(1)
 
         old_percentage = pbar.n

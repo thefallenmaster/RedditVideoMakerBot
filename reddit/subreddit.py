@@ -1,162 +1,229 @@
+import json
 import re
+from os.path import exists
 
-import praw
-from praw.models import MoreComments
-from prawcore.exceptions import ResponseException
+from playwright.sync_api import sync_playwright
 
 from utils import settings
 from utils.ai_methods import sort_by_similarity
 from utils.console import print_step, print_substep
+from utils.playwright import ensure_reddit_session
 from utils.posttextparser import posttextparser
-from utils.subreddit import _contains_blocked_words, get_subreddit_undone
-from utils.videos import check_done
+from utils.subreddit import _contains_blocked_words
 from utils.voice import sanitize_text
+from reddit.local_generator import get_local_thread
 
 
-def get_subreddit_threads(POST_ID: str):
-    """
-    Returns a list of threads from the AskReddit subreddit.
-    """
+def _fetch_json_in_context(page, path: str):
+    """Fetches a Reddit JSON endpoint using the active authenticated browser page."""
+    url = f"https://www.reddit.com{path}"
+    result = page.evaluate(
+        """async (targetUrl) => {
+            const resp = await fetch(targetUrl, {
+                credentials: "include",
+                headers: { "Accept": "application/json" }
+            });
+            const text = await resp.text();
+            return {
+                status: resp.status,
+                url: resp.url,
+                contentType: resp.headers.get("content-type") || "",
+                text: text
+            };
+        }""",
+        url,
+    )
 
-    print_substep("Logging into Reddit.")
-
-    content = {}
-    if settings.config["reddit"]["creds"]["2fa"]:
-        print("\nEnter your two-factor authentication code from your authenticator app.\n")
-        code = input("> ")
-        print()
-        pw = settings.config["reddit"]["creds"]["password"]
-        passkey = f"{pw}:{code}"
-    else:
-        passkey = settings.config["reddit"]["creds"]["password"]
-    username = settings.config["reddit"]["creds"]["username"]
-    if str(username).casefold().startswith("u/"):
-        username = username[2:]
-    try:
-        reddit = praw.Reddit(
-            client_id=settings.config["reddit"]["creds"]["client_id"],
-            client_secret=settings.config["reddit"]["creds"]["client_secret"],
-            user_agent="Accessing Reddit threads",
-            username=username,
-            passkey=passkey,
-            check_for_async=False,
+    if "/login" in (result.get("url") or ""):
+        raise RuntimeError(
+            f"Reddit redirected {url} to a login page. Please re-run and sign in manually."
         )
-    except ResponseException as e:
-        if e.response.status_code == 401:
-            print("Invalid credentials - please check them in config.toml")
-    except:
-        print("Something went wrong...")
+    if result.get("status") != 200:
+        raise RuntimeError(f"Reddit returned HTTP {result.get('status')} for {url}")
+    if "json" not in (result.get("contentType") or "").lower():
+        raise RuntimeError(
+            f"Reddit returned non-JSON response ({result.get('contentType')}) for {url}. "
+            "If verification is required, complete it in the browser window."
+        )
+    return json.loads(result["text"])
 
-    # Ask user for subreddit input
-    print_step("Getting subreddit threads...")
-    similarity_score = 0
-    if not settings.config["reddit"]["thread"][
-        "subreddit"
-    ]:  # note to user. you can have multiple subreddits via reddit.subreddit("redditdev+learnpython")
+
+def _load_done_ids() -> set:
+    if not exists("./video_creation/data/videos.json"):
+        with open("./video_creation/data/videos.json", "w", encoding="utf-8") as f:
+            json.dump([], f)
+        return set()
+    with open("./video_creation/data/videos.json", "r", encoding="utf-8") as f:
         try:
-            subreddit = reddit.subreddit(
-                re.sub(r"r\/", "", input("What subreddit would you like to pull from? "))
-                # removes the r/ from the input
+            return {video.get("id") for video in json.load(f) if isinstance(video, dict)}
+        except json.JSONDecodeError:
+            return set()
+
+
+def _select_post(posts: list, done_ids: set):
+    storymode = bool(settings.config["settings"]["storymode"])
+    allow_nsfw = bool(settings.config["settings"]["allow_nsfw"])
+    min_comments = int(settings.config["reddit"]["thread"]["min_comments"] or 0)
+    storymode_max_length = int(settings.config["settings"]["storymode_max_length"] or 2000)
+
+    for post in posts:
+        if post.get("id") in done_ids:
+            continue
+        if post.get("over_18") and not allow_nsfw:
+            print_substep("NSFW Post Detected. Skipping...")
+            continue
+        if post.get("stickied"):
+            print_substep("This post was pinned by moderators. Skipping...")
+            continue
+        title = post.get("title", "")
+        selftext = post.get("selftext", "") or ""
+        if _contains_blocked_words(f"{title} {selftext}"):
+            print_substep("Post contains a blocked word. Skipping...")
+            continue
+        if post.get("num_comments", 0) <= min_comments and not storymode:
+            print_substep(
+                f"This post has under the specified minimum of comments ({min_comments}). Skipping..."
             )
-        except ValueError:
-            subreddit = reddit.subreddit("askreddit")
-            print_substep("Subreddit not defined. Using AskReddit.")
-    else:
-        sub = settings.config["reddit"]["thread"]["subreddit"]
-        print_substep(f"Using subreddit: r/{sub} from TOML config")
-        subreddit_choice = sub
-        if str(subreddit_choice).casefold().startswith("r/"):  # removes the r/ from the input
-            subreddit_choice = subreddit_choice[2:]
-        subreddit = reddit.subreddit(subreddit_choice)
+            continue
+        if storymode:
+            if not post.get("is_self", True) or not selftext:
+                print_substep("You are trying to use story mode on post with no post text")
+                continue
+            if len(selftext) > storymode_max_length:
+                print_substep(
+                    f"Post is too long ({len(selftext)}), try with a different post. ({storymode_max_length} character limit)"
+                )
+                continue
+            if len(selftext) < 30:
+                continue
+        return post
+    return None
 
-    if POST_ID:  # would only be called if there are multiple queued posts
-        submission = reddit.submission(id=POST_ID)
 
-    elif (
-        settings.config["reddit"]["thread"]["post_id"]
-        and len(str(settings.config["reddit"]["thread"]["post_id"]).split("+")) == 1
-    ):
-        submission = reddit.submission(id=settings.config["reddit"]["thread"]["post_id"])
-    elif settings.config["ai"]["ai_similarity_enabled"]:  # ai sorting based on comparison
-        threads = subreddit.hot(limit=50)
-        keywords = settings.config["ai"]["ai_similarity_keywords"].split(",")
-        keywords = [keyword.strip() for keyword in keywords]
-        # Reformat the keywords for printing
-        keywords_print = ", ".join(keywords)
-        print(f"Sorting threads by similarity to the given keywords: {keywords_print}")
-        threads, similarity_scores = sort_by_similarity(threads, keywords)
-        submission, similarity_score = get_subreddit_undone(
-            threads, subreddit, similarity_scores=similarity_scores
-        )
-    else:
-        threads = subreddit.hot(limit=25)
-        submission = get_subreddit_undone(threads, subreddit)
+def get_subreddit_threads(POST_ID: str = None):
+    """Fetches a thread and comments locally or via authenticated browser session."""
+    if settings.config["reddit"]["thread"].get("use_local_stories", True):
+        return get_local_thread(POST_ID)
 
-    if submission is None:
-        return get_subreddit_threads(POST_ID)  # submission already done. rerun
+    print_step("Getting subreddit threads...")
+    subreddit = settings.config["reddit"]["thread"]["subreddit"] or "AskReddit"
+    subreddit = re.sub(r"^r/", "", str(subreddit).strip(), flags=re.IGNORECASE) or "AskReddit"
+    print_substep(f"Using subreddit: r/{subreddit}")
 
-    elif not submission.num_comments and settings.config["settings"]["storymode"] == "false":
-        print_substep("No comments found. Skipping.")
-        exit()
+    if not POST_ID:
+        cfg_post_id = str(settings.config["reddit"]["thread"].get("post_id") or "").strip()
+        if cfg_post_id and len(cfg_post_id.split("+")) == 1:
+            POST_ID = cfg_post_id
 
-    submission = check_done(submission)  # double-checking
+    def _load_thread_with_session(force_visible: bool):
+        with sync_playwright() as p:
+            context, page = ensure_reddit_session(
+                p,
+                target_url=f"https://www.reddit.com/r/{subreddit}/",
+                force_visible=force_visible,
+            )
+            try:
+                if POST_ID:
+                    data = _fetch_json_in_context(page, f"/comments/{POST_ID}.json?raw_json=1")
+                    return data[0]["data"]["children"][0]["data"], data[1]["data"]["children"]
 
-    upvotes = submission.score
-    ratio = submission.upvote_ratio * 100
-    num_comments = submission.num_comments
-    threadurl = f"https://new.reddit.com/{submission.permalink}"
+                listing = _fetch_json_in_context(
+                    page, f"/r/{subreddit}/hot.json?limit=25&raw_json=1"
+                )
+                posts = [
+                    child["data"]
+                    for child in listing.get("data", {}).get("children", [])
+                    if child.get("kind") == "t3"
+                ]
+                if settings.config["ai"].get("ai_similarity_enabled"):
+                    keywords_raw = settings.config["ai"].get("ai_similarity_keywords") or ""
+                    keywords = [kw.strip() for kw in keywords_raw.split(",") if kw.strip()]
+                    if keywords:
+                        print(
+                            f"Sorting threads by similarity to the given keywords: {', '.join(keywords)}"
+                        )
 
-    print_substep(f"Video will be: {submission.title} :thumbsup:", style="bold green")
-    print_substep(f"Thread url is: {threadurl} :thumbsup:", style="bold green")
+                        class _PostObj:
+                            def __init__(self, d):
+                                self.data = d
+                                self.title = d.get("title", "")
+                                self.selftext = d.get("selftext", "") or ""
+
+                        wrapped, _ = sort_by_similarity([_PostObj(p) for p in posts], keywords)
+                        posts = [w.data for w in wrapped]
+
+                done_ids = _load_done_ids()
+                selected = _select_post(posts, done_ids)
+                if selected is None:
+                    raise RuntimeError(f"No eligible posts found in r/{subreddit}.")
+
+                thread_json = _fetch_json_in_context(
+                    page, f"{selected['permalink'].rstrip('/')}.json?raw_json=1"
+                )
+                return thread_json[0]["data"]["children"][0]["data"], thread_json[1]["data"]["children"]
+            finally:
+                context.close()
+
+    try:
+        post, comments_data = _load_thread_with_session(force_visible=False)
+    except RuntimeError as err:
+        if "No eligible posts found" in str(err):
+            raise
+        # If headless profile was still gated by Reddit, retry in a visible browser window once
+        post, comments_data = _load_thread_with_session(force_visible=True)
+
+    thread_url = f"https://www.reddit.com{post['permalink']}"
+    upvotes = post.get("score", 0)
+    ratio = round(float(post.get("upvote_ratio", 0)) * 100, 1)
+    num_comments = post.get("num_comments", 0)
+
+    print_substep(f"Video will be: {post['title']} :thumbsup:", style="bold green")
+    print_substep(f"Thread url is: {thread_url} :thumbsup:", style="bold green")
     print_substep(f"Thread has {upvotes} upvotes", style="bold blue")
     print_substep(f"Thread has a upvote ratio of {ratio}%", style="bold blue")
     print_substep(f"Thread has {num_comments} comments", style="bold blue")
-    if similarity_score:
-        print_substep(
-            f"Thread has a similarity score up to {round(similarity_score * 100)}%",
-            style="bold blue",
-        )
 
-    content["thread_url"] = threadurl
-    content["thread_title"] = submission.title
-    content["thread_id"] = submission.id
-    content["is_nsfw"] = submission.over_18
-    content["comments"] = []
+    content = {
+        "thread_url": thread_url,
+        "thread_title": post["title"],
+        "thread_id": post["id"],
+        "is_nsfw": bool(post.get("over_18", False)),
+        "comments": [],
+    }
+
     if settings.config["settings"]["storymode"]:
+        selftext = post.get("selftext", "") or ""
         if settings.config["settings"]["storymodemethod"] == 1:
-            content["thread_post"] = posttextparser(submission.selftext)
+            content["thread_post"] = posttextparser(selftext)
         else:
-            content["thread_post"] = submission.selftext
+            content["thread_post"] = selftext
     else:
-        for top_level_comment in submission.comments:
-            if isinstance(top_level_comment, MoreComments):
+        max_len = int(settings.config["reddit"]["thread"]["max_comment_length"])
+        min_len = int(settings.config["reddit"]["thread"]["min_comment_length"])
+        for c in comments_data:
+            if c.get("kind") != "t1":
                 continue
-
-            if top_level_comment.body in ["[removed]", "[deleted]"]:
-                continue  # # see https://github.com/JasonLovesDoggo/RedditVideoMakerBot/issues/78
-            if _contains_blocked_words(top_level_comment.body):
+            cdata = c.get("data", {})
+            body = cdata.get("body")
+            if not body or body in ("[removed]", "[deleted]"):
                 continue
-            if not top_level_comment.stickied:
-                sanitised = sanitize_text(top_level_comment.body)
-                if not sanitised or sanitised == " ":
-                    continue
-                if len(top_level_comment.body) <= int(
-                    settings.config["reddit"]["thread"]["max_comment_length"]
-                ):
-                    if len(top_level_comment.body) >= int(
-                        settings.config["reddit"]["thread"]["min_comment_length"]
-                    ):
-                        if (
-                            top_level_comment.author is not None
-                            and sanitize_text(top_level_comment.body) is not None
-                        ):  # if errors occur with this change to if not.
-                            content["comments"].append(
-                                {
-                                    "comment_body": top_level_comment.body,
-                                    "comment_url": top_level_comment.permalink,
-                                    "comment_id": top_level_comment.id,
-                                }
-                            )
+            if cdata.get("stickied"):
+                continue
+            if cdata.get("author") in (None, "[deleted]"):
+                continue
+            if _contains_blocked_words(body):
+                continue
+            sanitised = sanitize_text(body)
+            if not sanitised or sanitised == " ":
+                continue
+            if min_len <= len(body) <= max_len:
+                content["comments"].append(
+                    {
+                        "comment_body": body,
+                        "comment_url": cdata["permalink"],
+                        "comment_id": cdata["id"],
+                    }
+                )
 
     print_substep("Received subreddit threads Successfully.", style="bold green")
     return content

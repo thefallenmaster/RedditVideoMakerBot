@@ -1,15 +1,15 @@
 import json
+import os
 import time
-
-from praw.models import Submission
+from typing import Any
 
 from utils import settings
 from utils.console import print_step
 
 
 def check_done(
-    redditobj: Submission,
-) -> Submission:
+    redditobj: Any,
+) -> Any:
     # don't set this to be run anyplace that isn't subreddit.py bc of inspect stack
     """Checks if the chosen post has already been generated
 
@@ -43,7 +43,12 @@ def save_data(subreddit: str, filename: str, reddit_title: str, reddit_id: str, 
         @param reddit_id:
         @param reddit_title:
     """
-    with open("./video_creation/data/videos.json", "r+", encoding="utf-8") as raw_vids:
+    videos_path = "./video_creation/data/videos.json"
+    if not os.path.exists(videos_path):
+        os.makedirs(os.path.dirname(videos_path), exist_ok=True)
+        with open(videos_path, "w", encoding="utf-8") as init_f:
+            json.dump([], init_f)
+    with open(videos_path, "r+", encoding="utf-8") as raw_vids:
         done_vids = json.load(raw_vids)
         if reddit_id in [video["id"] for video in done_vids]:
             return  # video already done but was specified to continue anyway in the config file
@@ -58,3 +63,4 @@ def save_data(subreddit: str, filename: str, reddit_title: str, reddit_id: str, 
         done_vids.append(payload)
         raw_vids.seek(0)
         json.dump(done_vids, raw_vids, ensure_ascii=False, indent=4)
+        raw_vids.truncate()

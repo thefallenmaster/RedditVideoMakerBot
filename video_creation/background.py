@@ -1,6 +1,8 @@
 import json
 import random
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from random import randrange
 from typing import Any, Dict, Tuple
@@ -11,6 +13,65 @@ from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 
 from utils import settings
 from utils.console import print_step, print_substep
+
+
+def _ydl_js_runtimes() -> dict:
+    """Returns installed JS runtimes for yt-dlp YouTube extraction."""
+    runtimes = {}
+    for rt in ("deno", "node", "bun"):
+        if shutil.which(rt):
+            runtimes[rt] = {}
+    return runtimes
+
+
+def _generate_fallback_video(target_path: Path, duration: int = 300) -> None:
+    """Generates a local animated background video via ffmpeg if YouTube is unavailable."""
+    print_substep("Generating local fallback background video via ffmpeg...", style="yellow")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"gradients=s=1080x1920:d={duration}:speed=0.05:c0=0x16213e:c1=0x0f3460",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-loglevel",
+            "error",
+            str(target_path),
+        ],
+        check=True,
+    )
+
+
+def _generate_fallback_audio(target_path: Path, duration: int = 300) -> None:
+    """Generates a gentle local ambient audio track via ffmpeg if YouTube is unavailable."""
+    print_substep("Generating local fallback background audio via ffmpeg...", style="yellow")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=220:sample_rate=44100:duration={duration}",
+            "-af",
+            "volume=0.05,lowpass=f=350",
+            "-codec:a",
+            "libmp3lame",
+            "-qscale:a",
+            "4",
+            "-loglevel",
+            "error",
+            str(target_path),
+        ],
+        check=True,
+    )
 
 
 def load_background_options():
@@ -78,22 +139,39 @@ def download_background_video(background_config: Tuple[str, str, str, Any]):
     Path("./assets/backgrounds/video/").mkdir(parents=True, exist_ok=True)
     # note: make sure the file name doesn't include an - in it
     uri, filename, credit, _ = background_config
-    if Path(f"assets/backgrounds/video/{credit}-{filename}").is_file():
+    target_path = Path(f"assets/backgrounds/video/{credit}-{filename}")
+    if target_path.is_file():
         return
+    # Remove stale partial files from interrupted downloads
+    part_path = Path(f"{target_path}.part")
+    if part_path.exists():
+        part_path.unlink()
+
     print_step(
         "We need to download the backgrounds videos. they are fairly large but it's only done once. 😎"
     )
     print_substep("Downloading the backgrounds videos... please be patient 🙏 ")
     print_substep(f"Downloading {filename} from {uri}")
     ydl_opts = {
-        "format": "bestvideo[height<=1080][ext=mp4]",
-        "outtmpl": f"assets/backgrounds/video/{credit}-{filename}",
+        "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/best[ext=mp4]",
+        "outtmpl": str(target_path),
         "retries": 10,
+        "fragment_retries": 10,
+        "overwrites": True,
     }
+    js_runtimes = _ydl_js_runtimes()
+    if js_runtimes:
+        ydl_opts["js_runtimes"] = js_runtimes
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download(uri)
-    print_substep("Background video downloaded successfully! 🎉", style="bold green")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([uri])
+        print_substep("Background video downloaded successfully! 🎉", style="bold green")
+    except Exception as err:
+        print_substep(f"YouTube background video download failed ({err}).", style="yellow")
+        if part_path.exists():
+            part_path.unlink()
+        _generate_fallback_video(target_path)
 
 
 def download_background_audio(background_config: Tuple[str, str, str]):
@@ -101,23 +179,40 @@ def download_background_audio(background_config: Tuple[str, str, str]):
     Path("./assets/backgrounds/audio/").mkdir(parents=True, exist_ok=True)
     # note: make sure the file name doesn't include an - in it
     uri, filename, credit = background_config
-    if Path(f"assets/backgrounds/audio/{credit}-{filename}").is_file():
+    target_path = Path(f"assets/backgrounds/audio/{credit}-{filename}")
+    if target_path.is_file():
         return
+    part_path = Path(f"{target_path}.part")
+    if part_path.exists():
+        part_path.unlink()
+
     print_step(
         "We need to download the backgrounds audio. they are fairly large but it's only done once. 😎"
     )
     print_substep("Downloading the backgrounds audio... please be patient 🙏 ")
     print_substep(f"Downloading {filename} from {uri}")
+    stem_outtmpl = str(target_path.with_suffix("")) + ".%(ext)s"
     ydl_opts = {
-        "outtmpl": f"./assets/backgrounds/audio/{credit}-{filename}",
+        "outtmpl": stem_outtmpl,
         "format": "bestaudio/best",
-        "extract_audio": True,
+        "retries": 10,
+        "fragment_retries": 10,
+        "overwrites": True,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
     }
+    js_runtimes = _ydl_js_runtimes()
+    if js_runtimes:
+        ydl_opts["js_runtimes"] = js_runtimes
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([uri])
-
-    print_substep("Background audio downloaded successfully! 🎉", style="bold green")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([uri])
+        print_substep("Background audio downloaded successfully! 🎉", style="bold green")
+    except Exception as err:
+        print_substep(f"YouTube background audio download failed ({err}).", style="yellow")
+        if part_path.exists():
+            part_path.unlink()
+        _generate_fallback_audio(target_path)
 
 
 def chop_background(background_config: Dict[str, Tuple], video_length: int, reddit_object: dict):
@@ -135,19 +230,19 @@ def chop_background(background_config: Dict[str, Tuple], video_length: int, redd
     else:
         print_step("Finding a spot in the backgrounds audio to chop...✂️")
         audio_choice = f"{background_config['audio'][2]}-{background_config['audio'][1]}"
-        background_audio = AudioFileClip(f"assets/backgrounds/audio/{audio_choice}")
-        start_time_audio, end_time_audio = get_start_and_end_times(
-            video_length, background_audio.duration
-        )
-        background_audio = background_audio.subclipped(start_time_audio, end_time_audio)
-        background_audio.write_audiofile(f"assets/temp/{thread_id}/background.mp3")
+        with AudioFileClip(f"assets/backgrounds/audio/{audio_choice}") as background_audio:
+            start_time_audio, end_time_audio = get_start_and_end_times(
+                video_length, background_audio.duration
+            )
+            sub_audio = background_audio.subclipped(start_time_audio, end_time_audio)
+            sub_audio.write_audiofile(f"assets/temp/{thread_id}/background.mp3")
 
     print_step("Finding a spot in the backgrounds video to chop...✂️")
     video_choice = f"{background_config['video'][2]}-{background_config['video'][1]}"
-    background_video = VideoFileClip(f"assets/backgrounds/video/{video_choice}")
-    start_time_video, end_time_video = get_start_and_end_times(
-        video_length, background_video.duration
-    )
+    with VideoFileClip(f"assets/backgrounds/video/{video_choice}") as background_video:
+        start_time_video, end_time_video = get_start_and_end_times(
+            video_length, background_video.duration
+        )
     # Extract video subclip
     try:
         with VideoFileClip(f"assets/backgrounds/video/{video_choice}") as video:
